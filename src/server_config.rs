@@ -1,7 +1,5 @@
 //! Server-specific TLS configuration
 
-use core::marker::PhantomData;
-
 use crate::config::PrivateKey;
 
 /// Server TLS configuration
@@ -10,9 +8,6 @@ pub struct TlsServerConfig<'a> {
     pub(crate) cert_chain: &'a [&'a [u8]],
     /// Server name (optional)
     pub(crate) server_name: Option<&'a str>,
-    /// Trust anchor that client certificates must chain to, when mutual TLS
-    /// is required. `None` disables client certificate authentication.
-    pub(crate) client_auth_ca: Option<&'a [u8]>,
     /// ALPN protocols supported by the server, in preference order
     pub(crate) alpn_protocols: Option<&'a [&'a [u8]]>,
 }
@@ -26,7 +21,6 @@ impl<'a> TlsServerConfig<'a> {
         Self {
             cert_chain,
             server_name: None,
-            client_auth_ca: None,
             alpn_protocols: None,
         }
     }
@@ -35,31 +29,6 @@ impl<'a> TlsServerConfig<'a> {
     #[must_use]
     pub fn with_server_name(mut self, name: &'a str) -> Self {
         self.server_name = Some(name);
-        self
-    }
-
-    /// Require client certificate authentication (mTLS).
-    ///
-    /// `trust_anchor` is the DER-encoded CA certificate that a presented client
-    /// certificate must chain to. The handshake is aborted if the client sends
-    /// no certificate, sends one that does not chain to `trust_anchor`, or
-    /// fails to prove possession of the corresponding private key.
-    ///
-    /// The trust anchor is required rather than optional so that mutual TLS
-    /// cannot be requested without saying who is trusted.
-    ///
-    /// Client authentication policy (fixed; no verifier is configurable):
-    /// the client certificate must be signed *directly* by `trust_anchor`,
-    /// following rustpki semantics: a leaf that chains through an intermediate
-    /// or through a certificate the root signed without CA:TRUE is rejected,
-    /// and no intermediates are accepted. No hostname matching or revocation
-    /// checking is performed: a client certificate carries no hostname the
-    /// server can meaningfully check, and revocation needs infrastructure an
-    /// embedded server does not have.
-    #[cfg(feature = "rustpki")]
-    #[must_use]
-    pub fn with_client_auth(mut self, trust_anchor: &'a [u8]) -> Self {
-        self.client_auth_ca = Some(trust_anchor);
         self
     }
 
@@ -72,32 +41,46 @@ impl<'a> TlsServerConfig<'a> {
 }
 
 /// Everything needed to accept a connection: the configuration, the key the
-/// server signs `CertificateVerify` with, and the clock type used for client
-/// certificate validity checking.
+/// server signs `CertificateVerify` with, and an optional client-certificate
+/// verifier.
 ///
-/// `Clock` is the [`TlsClock`](crate::config::TlsClock) implementation the
-/// server uses when checking a client certificate's dates, mirroring how the
-/// client chooses its clock for `CertVerifier`. Use
-/// [`InsecureIgnoreDates`](crate::config::InsecureIgnoreDates) to skip date
-/// checking explicitly.
-pub struct TlsServerContext<'a, Clock> {
+/// Client certificates are requested only when a verifier is supplied. With no
+/// verifier the server does not send `CertificateRequest` and accepts a client
+/// that sends no certificate.
+pub struct TlsServerContext<'a, Verifier = crate::config::InsecureNoVerify> {
     pub(crate) config: &'a TlsServerConfig<'a>,
     pub(crate) private_key: &'a PrivateKey,
-    pub(crate) _clock: PhantomData<fn() -> Clock>,
+    pub(crate) client_verifier: Option<Verifier>,
 }
 
-impl<'a, Clock> TlsServerContext<'a, Clock> {
-    /// Create a new server context.
-    ///
-    /// `private_key` must correspond to the leaf certificate in the
-    /// configuration's chain; the server proves possession of it on every
-    /// handshake.
+impl<'a> TlsServerContext<'a, crate::config::InsecureNoVerify> {
+    /// Create a server context with no client-certificate authentication.
     #[must_use]
     pub fn new(config: &'a TlsServerConfig<'a>, private_key: &'a PrivateKey) -> Self {
         Self {
             config,
             private_key,
-            _clock: PhantomData,
+            client_verifier: None,
+        }
+    }
+
+    /// Attach a client-certificate verifier to this context.
+    ///
+    /// Client certificates are requested and required during the handshake when
+    /// a verifier is attached: a client that sends no certificate is rejected.
+    ///
+    /// An implementation must validate the chain and its
+    /// policy in `verify_certificate` (the transcript passed there is the one
+    /// `CertificateVerify` signs), and in `verify_signature` check the
+    /// signature over the RFC 8446 section 4.4.3 content with the CLIENT
+    /// context string `"TLS 1.3, client CertificateVerify"`.
+    /// `set_hostname_verification` is never called by the server. The library
+    /// performs no hostname or revocation checking.
+    pub fn with_client_verifier<V>(self, verifier: V) -> TlsServerContext<'a, V> {
+        TlsServerContext {
+            config: self.config,
+            private_key: self.private_key,
+            client_verifier: Some(verifier),
         }
     }
 }

@@ -10,16 +10,12 @@
 
 use crate::TlsError;
 use crate::alert::{AlertDescription, AlertLevel};
-use crate::config::{PrivateKey, TlsCipherSuite, TlsClock};
+use crate::config::{PrivateKey, TlsCipherSuite, TlsVerifier};
 use crate::connection::decrypt_record;
 use crate::crypto::TlsHash;
 use crate::extensions::extension_data::key_share::KeyShareEntry;
 use crate::extensions::extension_data::supported_groups::NamedGroup;
 use crate::handshake::ServerHandshake as ServerHandshakeMessage;
-#[cfg(feature = "rustpki")]
-use crate::handshake::certificate::{
-    Certificate as OwnedCertificate, CertificateRef as ClientCertificate,
-};
 use crate::key_schedule::KeySchedule;
 use crate::record::ServerRecord;
 use crate::server::{
@@ -28,8 +24,6 @@ use crate::server::{
     encode_hello_retry_request, encode_server_hello,
 };
 use crate::server_config::TlsServerConfig;
-#[cfg(feature = "rustpki")]
-use crate::server_verify::{verify_client_certificate, verify_client_signature};
 use crate::write_buffer::WriteBuffer;
 use embassy_crypto::rng_fill_bytes;
 
@@ -50,12 +44,6 @@ const SIGALG_BITS: &[(u16, u8)] = &[
     (0x0805, 1 << 4),
     (0x0806, 1 << 5),
 ];
-
-/// Capacity for the client's certificate chain. Two kilobytes holds a typical
-/// P-256 leaf plus one intermediate; a larger chain is rejected with
-/// `OutOfMemory` rather than silently truncated.
-#[cfg(feature = "rustpki")]
-const CLIENT_CERT_SIZE: usize = 2048;
 
 /// One record of the server flight, in the order they are sent.
 #[derive(Clone, Copy)]
@@ -108,21 +96,18 @@ pub(crate) struct ServerHandshake<'a, CipherSuite: TlsCipherSuite> {
     client_hello_fingerprint: Option<<CipherSuite::Hash as TlsHash>::Output>,
     client_sigalg_mask: u8,
     traffic_hash: Option<CipherSuite::Hash>,
-    /// Owned copy of the client's certificate. The record buffer is reused
-    /// between reads, so it cannot be borrowed until the CertificateVerify.
-    #[cfg(feature = "rustpki")]
-    client_certificate: Option<OwnedCertificate<CLIENT_CERT_SIZE>>,
+    requires_client_auth: bool,
     /// Transcript captured when the client's Certificate arrived; the
     /// CertificateVerify signature is computed over exactly this.
-    #[cfg(feature = "rustpki")]
     client_cert_transcript: Option<CipherSuite::Hash>,
     client_cert_verified: bool,
 }
 
 impl<'a, CipherSuite: TlsCipherSuite> ServerHandshake<'a, CipherSuite> {
-    pub(crate) fn new(config: &'a TlsServerConfig<'a>) -> Self {
+    pub(crate) fn new(config: &'a TlsServerConfig<'a>, requires_client_auth: bool) -> Self {
         Self {
             config,
+            requires_client_auth,
             session_id: [0u8; 32],
             session_id_len: 0,
             key_share: None,
@@ -135,9 +120,6 @@ impl<'a, CipherSuite: TlsCipherSuite> ServerHandshake<'a, CipherSuite> {
             client_hello_fingerprint: None,
             client_sigalg_mask: 0,
             traffic_hash: None,
-            #[cfg(feature = "rustpki")]
-            client_certificate: None,
-            #[cfg(feature = "rustpki")]
             client_cert_transcript: None,
             client_cert_verified: false,
         }
@@ -237,7 +219,7 @@ impl<'a, CipherSuite: TlsCipherSuite> ServerHandshake<'a, CipherSuite> {
     }
 
     pub(crate) fn flight(&self) -> &'static [FlightRecord] {
-        if self.config.client_auth_ca.is_some() {
+        if self.requires_client_auth {
             &FLIGHT_WITH_CLIENT_AUTH
         } else {
             &FLIGHT
@@ -557,27 +539,22 @@ impl<'a, CipherSuite: TlsCipherSuite> ServerHandshake<'a, CipherSuite> {
     /// of the matching private key. A client that sends neither, or only one of
     /// the two, is rejected.
     #[allow(clippy::extra_unused_type_parameters)]
-    pub(crate) fn process_client_record<Clock>(
+    pub(crate) fn process_client_record<Verifier>(
         &mut self,
         key_schedule: &mut KeySchedule<CipherSuite>,
+        mut verifier: Option<&mut Verifier>,
         record: ServerRecord<'_, CipherSuite>,
     ) -> Result<bool, TlsError>
     where
-        Clock: TlsClock,
+        Verifier: TlsVerifier<CipherSuite>,
     {
         if let ServerRecord::ChangeCipherSpec(_) = &record {
             return Ok(false);
         }
 
         let mut finished_ok = false;
-        let requires_client_auth = self.config.client_auth_ca.is_some();
-        #[cfg(feature = "rustpki")]
-        let trust_anchor = self.config.client_auth_ca;
-        #[cfg(feature = "rustpki")]
-        let client_certificate = &mut self.client_certificate;
-        #[cfg(feature = "rustpki")]
+        let requires_client_auth = self.requires_client_auth;
         let client_cert_transcript = &mut self.client_cert_transcript;
-        #[cfg(feature = "rustpki")]
         let client_cert_verified = &mut self.client_cert_verified;
 
         decrypt_record(
@@ -592,9 +569,8 @@ impl<'a, CipherSuite: TlsCipherSuite> ServerHandshake<'a, CipherSuite> {
                     finished_ok = true;
                     Ok(())
                 }
-                #[cfg(feature = "rustpki")]
                 ServerRecord::Handshake(ServerHandshakeMessage::Certificate(certificate)) => {
-                    let Some(trust_anchor) = trust_anchor else {
+                    let Some(verifier) = verifier.as_mut() else {
                         // Client auth was not requested, so nothing to check.
                         return Ok(());
                     };
@@ -602,47 +578,26 @@ impl<'a, CipherSuite: TlsCipherSuite> ServerHandshake<'a, CipherSuite> {
                     // to and including this Certificate message.
                     let transcript = key_schedule.transcript_hash().clone();
 
-                    // The record buffer is reused, so the certificate has to be
-                    // copied out before it is verified or the CertificateVerify
-                    // is processed.
-                    *client_certificate = Some(certificate.try_into()?);
-                    let stored = unwrap!(client_certificate.as_ref());
-                    let presented: ClientCertificate<'_> = stored.try_into()?;
-
-                    verify_client_certificate::<CipherSuite, Clock>(
-                        trust_anchor,
-                        &transcript,
-                        presented,
-                    )?;
+                    verifier.verify_certificate(&transcript, certificate)?;
 
                     *client_cert_transcript = Some(transcript);
                     Ok(())
                 }
-                #[cfg(feature = "rustpki")]
                 ServerRecord::Handshake(ServerHandshakeMessage::CertificateVerify(verify)) => {
-                    if trust_anchor.is_none() {
+                    let Some(verifier) = verifier.as_mut() else {
                         return Ok(());
+                    };
+                    if client_cert_transcript.is_none() {
+                        return Err(TlsError::AbortHandshake(
+                            AlertLevel::Fatal,
+                            AlertDescription::UnexpectedMessage,
+                        ));
                     }
-                    let transcript =
-                        client_cert_transcript
-                            .as_ref()
-                            .ok_or(TlsError::AbortHandshake(
-                                AlertLevel::Fatal,
-                                AlertDescription::UnexpectedMessage,
-                            ))?;
-                    let stored = client_certificate.as_ref().ok_or(TlsError::AbortHandshake(
-                        AlertLevel::Fatal,
-                        AlertDescription::UnexpectedMessage,
-                    ))?;
-                    let certificate: ClientCertificate<'_> = stored.try_into()?;
-                    verify_client_signature::<CipherSuite>(transcript, &certificate, &verify)?;
+                    verifier.verify_signature(verify)?;
                     *client_cert_verified = true;
                     Ok(())
                 }
-                #[cfg(not(feature = "rustpki"))]
-                ServerRecord::Handshake(ServerHandshakeMessage::Certificate(_)) => Ok(()),
-                #[cfg(not(feature = "rustpki"))]
-                ServerRecord::Handshake(ServerHandshakeMessage::CertificateVerify(_)) => Ok(()),
+
                 ServerRecord::ChangeCipherSpec(_) => Ok(()),
                 _ => Err(TlsError::InvalidHandshake),
             },
@@ -838,7 +793,7 @@ mod hrr_validation_tests {
         let refs: &[&[u8]] = &[];
         let mut cfg = TlsServerConfig::new(refs);
         cfg = cfg.with_alpn(&[b"h2"]);
-        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg);
+        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg, false);
 
         let r1 = ServerRecord::Handshake(ServerHandshakeMessage::ClientHello(parse_ch(&ch1)));
         hs.absorb_client_hello(&r1).unwrap();
@@ -871,7 +826,7 @@ mod hrr_validation_tests {
         let refs: &[&[u8]] = &[];
         let mut cfg = TlsServerConfig::new(refs);
         cfg = cfg.with_alpn(&[b"h2"]);
-        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg);
+        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg, false);
 
         let r1 = ServerRecord::Handshake(ServerHandshakeMessage::ClientHello(parse_ch(&ch1)));
         hs.absorb_client_hello(&r1).unwrap();
@@ -902,7 +857,7 @@ mod hrr_validation_tests {
         let refs: &[&[u8]] = &[];
         let mut cfg = TlsServerConfig::new(refs);
         cfg = cfg.with_alpn(&[b"h2"]);
-        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg);
+        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg, false);
 
         let r1 = ServerRecord::Handshake(ServerHandshakeMessage::ClientHello(parse_ch(&ch1)));
         hs.absorb_client_hello(&r1).unwrap();
@@ -934,7 +889,7 @@ mod hrr_validation_tests {
         let refs: &[&[u8]] = &[];
         let mut cfg = TlsServerConfig::new(refs);
         cfg = cfg.with_alpn(&[b"h2"]);
-        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg);
+        let mut hs = ServerHandshake::<Aes128GcmSha256>::new(&cfg, false);
 
         let r1 = ServerRecord::Handshake(ServerHandshakeMessage::ClientHello(parse_ch(&ch1)));
         hs.absorb_client_hello(&r1).unwrap();

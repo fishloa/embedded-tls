@@ -131,12 +131,12 @@ where
     /// On failure the peer is told why with a TLS alert before the error is
     /// returned, so interop problems are diagnosable from the client side.
     #[cfg(feature = "server")]
-    pub async fn open_server<Clock>(
+    pub async fn open_server<Verifier>(
         &mut self,
-        context: crate::server_config::TlsServerContext<'_, Clock>,
+        context: crate::server_config::TlsServerContext<'_, Verifier>,
     ) -> Result<(), TlsError>
     where
-        Clock: crate::config::TlsClock,
+        Verifier: crate::TlsVerifier<CipherSuite>,
     {
         let result = self.open_server_handshake(context).await;
 
@@ -183,21 +183,23 @@ where
     }
 
     #[cfg(feature = "server")]
-    async fn open_server_handshake<Clock>(
+    async fn open_server_handshake<Verifier>(
         &mut self,
-        context: crate::server_config::TlsServerContext<'_, Clock>,
+        context: crate::server_config::TlsServerContext<'_, Verifier>,
     ) -> Result<(), TlsError>
     where
-        Clock: crate::config::TlsClock,
+        Verifier: crate::TlsVerifier<CipherSuite>,
     {
         use crate::server_handshake::{CHANGE_CIPHER_SPEC, ServerHandshake};
 
         let crate::server_config::TlsServerContext {
             config,
             private_key,
-            ..
+            mut client_verifier,
         } = context;
-        let mut handshake: ServerHandshake<'_, CipherSuite> = ServerHandshake::new(config);
+        let requires_client_auth = client_verifier.is_some();
+        let mut handshake: ServerHandshake<'_, CipherSuite> =
+            ServerHandshake::new(config, requires_client_auth);
 
         macro_rules! send {
             ($outgoing:expr) => {{
@@ -281,7 +283,11 @@ where
                 .record_reader
                 .read(&mut self.delegate, self.key_schedule.read_state())
                 .await?;
-            if handshake.process_client_record::<Clock>(&mut self.key_schedule, record)? {
+            if handshake.process_client_record(
+                &mut self.key_schedule,
+                client_verifier.as_mut(),
+                record,
+            )? {
                 break;
             }
         }

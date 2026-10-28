@@ -105,8 +105,6 @@ pub(crate) mod server;
 mod server_config;
 #[cfg(feature = "server")]
 mod server_handshake;
-#[cfg(all(feature = "server", feature = "rustpki"))]
-mod server_verify;
 mod write_buffer;
 
 pub use embassy_crypto;
